@@ -37,6 +37,8 @@ def _get_openai() -> OpenAI:
 class PromptType(str, Enum):
     FRAMES_REPHRASE = "frames_rephrase"
     RAGAS_WO_NV_ACCURACY = "ragas_wo_nv_accuracy"
+    ANSWER_RELEVANCY = "answer_relevancy"
+    FAITHFULNESS = "faithfulness"
     EVAL_TEXT2SQL_ALIGNMENT = "eval_text2sql_alignment"
     LLM_KEYWORDS = "llm_keywords"
 
@@ -51,9 +53,43 @@ _PROMPTS: dict[str, str] = {
         "Question: {query}\nRephrased:"
     ),
     PromptType.RAGAS_WO_NV_ACCURACY: (
-        "Given the question, expected answer, and actual answer, rate how accurate the actual answer is.\n"
-        "Question: {query}\nExpected: {sentence_true}\nActual: {sentence_inference}\n"
-        "Output format: {output_format}\nRating:"
+        "You are a world class state of the art assistant for rating a User Answer given a Question.\n\n"
+        "# Question:\n{query}\n\n"
+        "# Reference Answer:\n{sentence_true}\n\n"
+        "# User Answer:\n{sentence_inference}\n\n"
+        "# Instructions: \n"
+        "The Question is completely answered by the Reference Answer.\n"
+        "Say 4, if User Answer is full contained and equivalent to Reference Answer in all terms, topics, numbers, metrics, dates and units.\n"
+        "Say 2, if User Answer is partially contained and almost equivalent to Reference Answer in all terms, topics, numbers, metrics, dates and units.\n"
+        "Say 0, if User Answer is not contained in Reference Answer or not accurate in all terms, topics, numbers, metrics, dates and units or the User Answer do not answer the question.\n\n"
+        "Do not explain or justify your rating. Your rating must be only 4, 2 or 0 according to the instructions above.\n\n"
+        "# Output format:\n{output_format}\n\n"
+        "The rating is (Only the JSON, nothing else): "
+    ),
+    PromptType.ANSWER_RELEVANCY: (
+        "You are an expert evaluator assessing whether a User Answer is relevant to a Question.\n\n"
+        "# Question:\n{query}\n\n"
+        "# User Answer:\n{sentence_inference}\n\n"
+        "# Instructions:\n"
+        "Say 4, if the User Answer directly and completely addresses the Question.\n"
+        "Say 2, if the User Answer partially addresses the Question or is only tangentially related.\n"
+        "Say 0, if the User Answer does not address the Question at all or is off-topic.\n\n"
+        "Do not explain or justify your rating. Your rating must be only 4, 2 or 0.\n\n"
+        "# Output format:\n{output_format}\n\n"
+        "The rating is (Only the JSON, nothing else): "
+    ),
+    PromptType.FAITHFULNESS: (
+        "You are an expert evaluator assessing whether a User Answer is faithful to a Reference Answer.\n\n"
+        "# Question:\n{query}\n\n"
+        "# Reference Answer:\n{sentence_true}\n\n"
+        "# User Answer:\n{sentence_inference}\n\n"
+        "# Instructions:\n"
+        "Say 4, if the User Answer contains no contradictions with the Reference Answer and all stated facts are consistent.\n"
+        "Say 2, if the User Answer has minor inconsistencies or omissions compared to the Reference Answer.\n"
+        "Say 0, if the User Answer contradicts the Reference Answer or contains clearly false information relative to it.\n\n"
+        "Do not explain or justify your rating. Your rating must be only 4, 2 or 0.\n\n"
+        "# Output format:\n{output_format}\n\n"
+        "The rating is (Only the JSON, nothing else): "
     ),
     PromptType.EVAL_TEXT2SQL_ALIGNMENT: (
         "Compare the two SQL queries for semantic alignment.\n"

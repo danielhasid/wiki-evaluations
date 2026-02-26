@@ -11,7 +11,7 @@ class ExportRecord(TypedDict):
     query: str
     response: str
     ground_truth: str
-    score: float
+    scores: Dict[str, float]
 
 
 class NvAccuracyScoreWO(BaseModel):
@@ -24,59 +24,74 @@ class NvAccuracyScoreWO(BaseModel):
 
 LOGGER = WiseryLogger().get_logger()
 
-GOLDENSET_FRAMES = 'correctness_frames'
-FULL_FRAMES_COLLECTION = "full_frames_with_entities"
 EVAL_COLLECTION = 'final_answer_correctness'
 EXCEL_CORRECTNESS = EVAL_COLLECTION + ".xlsx"
 
+GROUND_TRUTH_CSV = "data/ground_truth_frames.csv"
+MESSAGES_CSV = "data/messages.csv"
+
 
 def load_ground_truth_frames(
-    golden_set_db: str = GOLDENSET_FRAMES,
-    collection_name: str = FULL_FRAMES_COLLECTION,
+    csv_path: str = GROUND_TRUTH_CSV,
 ) -> pd.DataFrame:
     """
-    Load the FRAMES ground truth dataset from MongoDB.
+    Load the FRAMES ground truth dataset from a CSV file.
 
     Args:
-        golden_set_db (str): The database name containing the ground truth collection.
-        collection_name (str): actual data collection name
+        csv_path (str): Path to the ground truth CSV file.
+            Expected columns: Prompt, Answer, wiki_links_entities
 
     Returns:
         pd.DataFrame: DataFrame containing the ground truth data.
 
     Raises:
-        Exception: If no data is found.
+        Exception: If the file is missing or empty.
     """
-    LOGGER.info("Loading ground truth frames...")
-    ground_truth_db = db_controller.get_db_data(db_name=golden_set_db, collection_name=collection_name)
-    if not ground_truth_db:
-        raise Exception(f"Ground truth not found in DB '{golden_set_db}', collection '{collection_name}'.")
-    return pd.DataFrame.from_dict(ground_truth_db)
+    LOGGER.info(f"Loading ground truth frames from '{csv_path}'...")
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        raise Exception(f"Ground truth CSV not found at '{csv_path}'.")
+    if df.empty:
+        raise Exception(f"Ground truth CSV at '{csv_path}' is empty.")
+    return df
 
 
-def load_user_queries(conversation_db: str, db_filter: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+def load_user_queries(conversation_db: str = "", db_filter: Optional[Dict[str, Any]] = None,
+                      csv_path: str = MESSAGES_CSV) -> pd.DataFrame:
     """
-    Load user queries from the 'messages' collection.
+    Load user queries from a CSV file.
 
     Args:
-        conversation_db (str): Database name containing user messages.
-        db_filter (Optional[Dict[str, Any]]): Mongo filter for selecting specific messages.
+        conversation_db (str): Unused — kept for backwards compatibility.
+        db_filter (Optional[Dict[str, Any]]): Key/value pairs applied as equality
+            filters on the loaded DataFrame columns (e.g. {"step_id": None}).
+        csv_path (str): Path to the messages CSV file.
+            Expected columns: query, response, step_id
 
     Returns:
         pd.DataFrame: DataFrame of user messages.
 
     Raises:
-        Exception: If no messages are found.
+        Exception: If the file is missing or no rows remain after filtering.
     """
-    LOGGER.info("Loading user queries...")
-    user_messages_db = db_controller.get_db_data(
-        db_name=conversation_db,
-        collection_name='messages',
-        filter_term=db_filter or {}
-    )
-    if not user_messages_db:
-        raise Exception(f"No user queries found in DB '{conversation_db}', collection 'messages'.")
-    return pd.DataFrame.from_dict(user_messages_db)
+    LOGGER.info(f"Loading user queries from '{csv_path}'...")
+    try:
+        df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        raise Exception(f"Messages CSV not found at '{csv_path}'.")
+
+    if db_filter:
+        for col, val in db_filter.items():
+            if col in df.columns:
+                if val is None:
+                    df = df[df[col].isna()]
+                else:
+                    df = df[df[col] == val]
+
+    if df.empty:
+        raise Exception(f"No user queries found in '{csv_path}' after applying filter {db_filter}.")
+    return df
 
 
 def compute_final_answer_correctness_metrics(
@@ -136,18 +151,39 @@ def evaluate_query_ragas(
     ground_truth_str = str(matching_rows.iloc[0]["Answer"])
 
     if response == "I could not find an answer to this query":
-        rating_score = 0.0
+        scores = {"ragas_accuracy": 0.0, "answer_relevancy": 0.0, "faithfulness": 0.0}
     else:
+        # ragas_accuracy: bidirectional NV accuracy (normalised to 0-1)
         score1 = examine_final_answer_prompt(query, ground_truth_str, response, pydantic_object)
         score2 = examine_final_answer_prompt(query, response, ground_truth_str, pydantic_object)
-        rating_score = (score1 + score2) / 8.0
+        ragas_accuracy = (score1 + score2) / 8.0
 
-    LOGGER.info(f"Query: {query} | Score: {rating_score}")
+        # answer_relevancy: does the response address the question? (normalised to 0-1)
+        ar_raw = examine_final_answer_prompt(
+            query, "", response, pydantic_object,
+            prompt_type=PromptType.ANSWER_RELEVANCY
+        )
+        answer_relevancy = ar_raw / 4.0
+
+        # faithfulness: is the response consistent with the ground truth? (normalised to 0-1)
+        faith_raw = examine_final_answer_prompt(
+            query, ground_truth_str, response, pydantic_object,
+            prompt_type=PromptType.FAITHFULNESS
+        )
+        faithfulness = faith_raw / 4.0
+
+        scores = {
+            "ragas_accuracy": round(ragas_accuracy, 4),
+            "answer_relevancy": round(answer_relevancy, 4),
+            "faithfulness": round(faithfulness, 4),
+        }
+
+    LOGGER.info(f"Query: {query} | Scores: {scores}")
     return ExportRecord(
         query=query,
         response=response,
         ground_truth=ground_truth_str,
-        score=rating_score
+        scores=scores
     )
 
 
@@ -155,34 +191,38 @@ def examine_final_answer_prompt(
         query: str,
         expected_answer: str,
         actual_answer: str,
-        pydantic_object: Any
+        pydantic_object: Any,
+        prompt_type: PromptType = PromptType.RAGAS_WO_NV_ACCURACY,
 ) -> float:
     """
-    Execute the LLM prompt for answer comparison and parse its score.
+    Execute the LLM prompt for answer evaluation and parse its score.
 
     Args:
         query (str): The query.
-        expected_answer (str): Ground truth answer.
+        expected_answer (str): Ground truth answer (may be empty for relevancy-only prompts).
         actual_answer (str): Model's answer.
         pydantic_object (Any): Pydantic validation model.
+        prompt_type (PromptType): Which prompt to use for evaluation.
 
     Returns:
-        float: The numeric score.
+        float: The raw numeric score returned by the LLM (0, 2, or 4).
     """
-    LOGGER.info(f"Comparing answers: expected='{expected_answer}' | actual='{actual_answer}'")
+    LOGGER.info(f"[{prompt_type.value}] expected='{expected_answer}' | actual='{actual_answer}'")
     parser = JsonOutputParser(pydantic_object=pydantic_object)
     output_format = parser.get_format_instructions()
 
-    result = execute_prompt(
-        prompt_type=PromptType.RAGAS_WO_NV_ACCURACY,
+    kwargs: Dict[str, Any] = dict(
         query=query,
-        sentence_true=expected_answer,
         sentence_inference=actual_answer,
-        output_format=output_format
+        output_format=output_format,
     )
-    nv_accuracy = parser.invoke(result)
-    LOGGER.debug(f"LLM parsed score: {nv_accuracy}")
-    return float(nv_accuracy['rating_score'])
+    if prompt_type != PromptType.ANSWER_RELEVANCY:
+        kwargs["sentence_true"] = expected_answer
+
+    result = execute_prompt(prompt_type=prompt_type, **kwargs)
+    parsed = parser.invoke(result)
+    LOGGER.debug(f"LLM parsed score: {parsed}")
+    return float(parsed['rating_score'])
 
 
 def export_results(records: List[ExportRecord], conversation_db: str) -> None:
@@ -211,23 +251,32 @@ def export_to_excel_final_answer_correctness_info(conversation_db: str, records:
     """
     Export evaluation results to an Excel file.
 
+    Columns: query | response | ground_truth | scores.<metric> ...
+    A final 'Average' row shows the mean for every score column.
+
     Args:
         conversation_db (str): Conversation DB name (used in filename).
         records (List[ExportRecord]): Records to save.
     """
     LOGGER.info("Creating Excel export...")
+    # pd.json_normalize flattens {"scores": {"ragas_accuracy": 1.0, ...}}
+    # into columns named  scores.ragas_accuracy, scores.answer_relevancy, …
     df = pd.json_normalize(records)
-    avg_row = {
-        'score': df['score'].mean(),
-        'query': 'Average',
-        'response': '',
-        'ground_truth': '',
-        '_id': ''
-    }
+
+    score_cols = [c for c in df.columns if c.startswith("scores.")]
+    avg_row: Dict[str, Any] = {"query": "Average", "response": "", "ground_truth": ""}
+    for col in score_cols:
+        avg_row[col] = round(df[col].mean(), 4)
 
     df = pd.concat([df, pd.DataFrame([avg_row])], ignore_index=True)
-    df.to_excel(conversation_db + "_" + EXCEL_CORRECTNESS, index=False)
-    LOGGER.info(f"Excel file saved: {EXCEL_CORRECTNESS}")
+
+    # Reorder: identity columns first, then score columns
+    ordered_cols = ["query", "response", "ground_truth"] + score_cols
+    df = df[[c for c in ordered_cols if c in df.columns]]
+
+    filepath = conversation_db + "_" + EXCEL_CORRECTNESS
+    df.to_excel(filepath, index=False)
+    LOGGER.info(f"Excel file saved: {filepath}")
 
 
 def test_compute_final_answer_correctness_metrics(conversation_db_name: str) -> None:
